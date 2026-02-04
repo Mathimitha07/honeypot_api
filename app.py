@@ -11,7 +11,6 @@ from callback_reporter import try_send_final_callback
 app = FastAPI()
 
 
-# Health check (Render / uptime checks)
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -19,15 +18,11 @@ def root():
 
 @app.post("/honeypot")
 def honeypot(payload: Dict, x_api_key: str = Header(None)):
-    # -----------------
     # Auth
-    # -----------------
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # -----------------
-    # Minimal schema validation (matches hackathon input format)
-    # -----------------
+    # Validate input
     if (
         "sessionId" not in payload
         or "message" not in payload
@@ -38,28 +33,28 @@ def honeypot(payload: Dict, x_api_key: str = Header(None)):
 
     session_id = payload["sessionId"]
     msg_text = payload["message"]["text"]
-    history = payload.get("conversationHistory", [])
-    metadata = payload.get("metadata", {})
 
-    # -----------------
-    # Load state (in-memory)
-    # -----------------
+    history = payload.get("conversationHistory", [])
+    if history is None or not isinstance(history, list):
+        history = []
+
+    metadata = payload.get("metadata", {})
+    if metadata is None or not isinstance(metadata, dict):
+        metadata = {}
+
+    # Load state
     state = load_session(session_id)
 
-    # If server restarted / Render slept and memory is lost, rebuild from conversationHistory
-    # (Important: the platform *will* send conversationHistory in follow-up messages)
+    # If memory is fresh but we have history, rebuild (Render restart/sleep)
     if is_fresh_state(state) and history:
         rebuild_from_history(state, history, extract_all)
 
-    # Count turns (one per incoming request/message)
-    state.turnCount = max(state.turnCount, 0) + 1
+    # Count turn (one per incoming request)
+    state.turnCount = (state.turnCount or 0) + 1
 
-    # -----------------
-    # 1) Extract intelligence from the incoming message
-    # -----------------
+    # 1) Extract intelligence from incoming message
     extracted = extract_all(msg_text)
 
-    # Merge unique extracted values into state
     for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
         vals = extracted.get(k, []) or []
         if not vals:
@@ -70,14 +65,11 @@ def honeypot(payload: Dict, x_api_key: str = Header(None)):
                 current.append(v)
         setattr(state, k, current)
 
-    # Merge suspicious keywords
     for w in extracted.get("suspiciousKeywords", []) or []:
         if w not in state.suspiciousKeywords:
             state.suspiciousKeywords.append(w)
 
-    # -----------------
-    # 2) Detect scam intent (only once per session)
-    # -----------------
+    # 2) Detect scam intent (only once)
     if not state.scamDetected:
         det = detect_scam(msg_text, history, metadata)
         state.scamDetected = det.get("scamDetected", False)
@@ -86,32 +78,23 @@ def honeypot(payload: Dict, x_api_key: str = Header(None)):
             if kw not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(kw)
 
-    # -----------------
-    # 3) Generate reply (agentic if scam)
-    # -----------------
+    # 3) Generate reply
     if state.scamDetected:
         reply, updates = next_reply(state, msg_text, history, metadata)
         state.stage = updates.get("stage", state.stage)
-        state.turnCount = updates.get("turnCount", state.turnCount)
     else:
-        # If not scam, keep it bland and non-provocative
         reply = "Sorry, I didn't understand. Can you explain?"
 
-    # -----------------
-    # 4) Mandatory callback when engagement completes
-    # -----------------
+    # 4) Mandatory callback (when should_complete becomes true)
     try_send_final_callback(state)
 
-    # Persist state
     save_session(state)
 
-    # Strict output required by hackathon
     return {"status": "success", "reply": reply}
 
 
 # ---------------------------
-# DEBUG ROUTES (LOCAL TESTING ONLY)
-# Keep these for your testing; remove/comment before final submission if you want.
+# DEBUG ROUTES (Protected)
 # ---------------------------
 
 @app.get("/debug/session/{session_id}")
@@ -147,12 +130,24 @@ def debug_extract(payload: Dict, x_api_key: str = Header(None)):
     return extract_all(text)
 
 
-# Receives callback payload locally for testing (LOCAL ONLY)
+@app.get("/debug/callback_url")
+def debug_callback_url(x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return {"CALLBACK_URL": CALLBACK_URL}
+
+
+# ---------------------------
+# MOCK CALLBACK (Protected)
+# ---------------------------
 _LAST_CALLBACK = None
 
 
 @app.post("/mock_callback")
-def mock_callback(payload: Dict):
+def mock_callback(payload: Dict, x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     global _LAST_CALLBACK
     _LAST_CALLBACK = payload
     return {"ok": True}
@@ -162,11 +157,5 @@ def mock_callback(payload: Dict):
 def mock_callback_latest(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     return _LAST_CALLBACK or {"ok": False, "reason": "No callback received yet"}
-
-
-@app.get("/debug/callback_url")
-def debug_callback_url(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return {"CALLBACK_URL": CALLBACK_URL}

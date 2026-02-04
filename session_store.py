@@ -11,7 +11,7 @@ class SessionState:
     stage: str = "HOOK"  # HOOK / FRICTION / EXTRACT / VERIFY / EXIT
     turnCount: int = 0
 
-    completed: bool = False
+    completed: bool = False           # True only AFTER callback succeeds
     callbackFailures: int = 0
 
     upiIds: List[str] = field(default_factory=list)
@@ -24,8 +24,8 @@ class SessionState:
 
     def should_complete(self) -> bool:
         """
-        Callback-safe completion rules.
-        Goal: avoid "no callback" scoring failures, but also avoid ending too early.
+        Callback-safe completion rules:
+        - Enough engagement + enough intelligence => finalize and send callback.
         """
         categories = 0
         categories += 1 if self.upiIds else 0
@@ -33,7 +33,7 @@ class SessionState:
         categories += 1 if self.phishingLinks else 0
         categories += 1 if self.phoneNumbers else 0
 
-        # Strong signal: 2 categories + enough engagement
+        # Strong signal: 2 categories + decent engagement
         if categories >= 2 and self.turnCount >= 8:
             return True
 
@@ -49,13 +49,6 @@ class SessionState:
 
     def build_callback_payload(self) -> Dict[str, Any]:
         items = len(self.upiIds) + len(self.bankAccounts) + len(self.phishingLinks) + len(self.phoneNumbers)
-        categories = sum([
-            1 if self.upiIds else 0,
-            1 if self.bankAccounts else 0,
-            1 if self.phishingLinks else 0,
-            1 if self.phoneNumbers else 0,
-        ])
-
         return {
             "sessionId": self.sessionId,
             "scamDetected": self.scamDetected,
@@ -69,15 +62,12 @@ class SessionState:
             },
             "agentNotes": (
                 "Scam conversation engagement completed. "
-                f"scamType={self.scamType}, stage={self.stage}, "
-                f"categories={categories}, items={items}, keywords={len(self.suspiciousKeywords)}"
+                f"scamType={self.scamType}, stage={self.stage}, items={items}"
             ),
         }
 
 
-# -------------------------
-# In-memory session store (OK for hackathon). Replace with Redis later if needed.
-# -------------------------
+# In-memory store (hackathon OK). Render may restart -> we rebuild from conversationHistory.
 _STORE: Dict[str, SessionState] = {}
 
 
@@ -93,7 +83,7 @@ def save_session(state: SessionState) -> None:
 
 
 def is_fresh_state(state: SessionState) -> bool:
-    """True if this session was just created and has no meaningful state yet."""
+    """True if this session has no meaningful stored state yet."""
     return (
         state.turnCount == 0
         and not state.upiIds
@@ -102,6 +92,8 @@ def is_fresh_state(state: SessionState) -> bool:
         and not state.phoneNumbers
         and not state.suspiciousKeywords
         and not state.scamDetected
+        and not state.completed
+        and state.callbackFailures == 0
     )
 
 
@@ -111,15 +103,14 @@ def rebuild_from_history(
     extractor_fn: Callable[[str], Dict[str, List[str]]],
 ) -> None:
     """
-    Rebuilds intel from conversationHistory if server restarted and memory is lost.
-    extractor_fn should be extract_all(text) from extractor.py
-
-    IMPORTANT:
-    - app.py should increment turnCount for the current incoming message,
-      so here we set turnCount to len(history) (not +1).
+    Rebuild state from conversationHistory after server restart/sleep.
+    IMPORTANT FIX:
+    - We set turnCount to len(history), not len(history)+1.
+      The current incoming message will be counted in app.py.
     """
+    if not isinstance(history, list):
+        return
 
-    # Past turns = number of messages in history
     state.turnCount = max(state.turnCount, len(history))
 
     for m in history:
@@ -129,7 +120,6 @@ def rebuild_from_history(
 
         extracted = extractor_fn(text)
 
-        # Merge unique extracted values
         for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
             vals = extracted.get(k, []) or []
             if not vals:
@@ -140,7 +130,6 @@ def rebuild_from_history(
                     current.append(v)
             setattr(state, k, current)
 
-        # Merge suspicious keywords
         for w in extracted.get("suspiciousKeywords", []) or []:
             if w not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(w)
