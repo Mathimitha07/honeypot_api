@@ -138,3 +138,7 @@ def debug_callback_url(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return {"CALLBACK_URL": CALLBACK_URL}
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
