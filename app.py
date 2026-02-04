@@ -1,7 +1,7 @@
 # app.py
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
@@ -13,12 +13,10 @@ from extractor import extract_all
 from agent_engine import next_reply
 from callback_reporter import try_send_final_callback
 
-
 app = FastAPI()
 
-
 # -------------------------
-# Models (strict where needed, flexible overall)
+# Models
 # -------------------------
 class Message(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -36,34 +34,26 @@ class HoneypotPayload(BaseModel):
 
 
 # -------------------------
-# Error handling to match GUVI-style tester expectations
-# (Instead of raw FastAPI 422/400)
+# Error handling (GUVI-style)
 # -------------------------
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # GUVI tester expects this exact style
     return JSONResponse(
         status_code=200,
-        content={
-            "status": "error",
-            "message": "INVALID_REQUEST_BODY",
-            "errorCode": "E400",
-        },
+        content={"status": "error", "message": "INVALID_REQUEST_BODY", "errorCode": "E400"},
     )
 
 
 def unauthorized():
     return JSONResponse(
         status_code=401,
-        content={
-            "status": "error",
-            "message": "UNAUTHORIZED",
-            "errorCode": "E401",
-        },
+        content={"status": "error", "message": "UNAUTHORIZED", "errorCode": "E401"},
     )
 
 
 # -------------------------
-# Health check (Render)
+# Health check
 # -------------------------
 @app.get("/")
 def root():
@@ -74,70 +64,78 @@ def root():
 # Main endpoint
 # -------------------------
 @app.post("/honeypot")
-def honeypot(payload: HoneypotPayload, x_api_key: Optional[str] = Header(None, alias="x-api-key")):
+def honeypot(
+    payload: HoneypotPayload,
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
     # Auth
     if not API_KEY or x_api_key != API_KEY:
         return unauthorized()
 
     session_id = payload.sessionId
-    msg_text = payload.message.text
-    history = [m.model_dump() for m in (payload.conversationHistory or [])]
+    msg_text = (payload.message.text or "").strip()
+    history = payload.conversationHistory or []
     metadata = payload.metadata or {}
 
     # Load state
     state = load_session(session_id)
 
-    # If Render slept / restarted and memory is empty, rebuild from conversationHistory
+    # Rebuild after Render sleep/restart
     if is_fresh_state(state) and history:
-        rebuild_from_history(state, history, extract_all)
+        # Convert Message objects -> dicts
+        history_dicts = [m.model_dump() for m in history]
+        rebuild_from_history(state, history_dicts, extract_all)
 
     # Count turns (one per incoming request)
     state.turnCount = (state.turnCount or 0) + 1
 
-    # 1) Extract intelligence from incoming message
+    # Extract intelligence from incoming message
     extracted = extract_all(msg_text)
 
     for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
         vals = extracted.get(k, []) or []
-        if not vals:
-            continue
-        current = getattr(state, k, [])
-        for v in vals:
-            if v not in current:
-                current.append(v)
-        setattr(state, k, current)
+        if vals:
+            current = getattr(state, k, [])
+            for v in vals:
+                if v not in current:
+                    current.append(v)
+            setattr(state, k, current)
 
     for w in extracted.get("suspiciousKeywords", []) or []:
         if w not in state.suspiciousKeywords:
             state.suspiciousKeywords.append(w)
 
-    # 2) Detect scam intent (only once per session)
+    # Detect scam intent once
     if not state.scamDetected:
-        det = detect_scam(msg_text, history, metadata)
-        state.scamDetected = bool(det.get("scamDetected", False))
-        state.scamType = det.get("scamType", "unknown") or "unknown"
+        # Convert history to dicts for detector
+        history_dicts = [m.model_dump() for m in history]
+        det = detect_scam(msg_text, history_dicts, metadata)
+        state.scamDetected = det.get("scamDetected", False)
+        state.scamType = det.get("scamType", "unknown")
         for kw in det.get("keywords", []) or []:
             if kw not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(kw)
 
-    # 3) Generate reply
+    # Generate reply
     if state.scamDetected:
-        reply, updates = next_reply(state, msg_text, history, metadata)
+        # Convert history to dicts for agent
+        history_dicts = [m.model_dump() for m in history]
+        reply, updates = next_reply(state, msg_text, history_dicts, metadata)
         state.stage = updates.get("stage", state.stage)
     else:
-        reply = "Sorry, I didn't understand. Can you explain?"
+        reply = "Okay. Can you share more details?"
 
-    # 4) Mandatory callback once engagement completes
+    # Mandatory callback
     try_send_final_callback(state)
 
+    # Save state
     save_session(state)
 
-    # Output required by hackathon
     return {"status": "success", "reply": reply}
 
 
 # -------------------------
-# Debug routes (disable in production)
+# Debug routes only in dev
 # -------------------------
 if ENV != "prod":
 
