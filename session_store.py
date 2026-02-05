@@ -1,15 +1,18 @@
 # session_store.py
 from dataclasses import dataclass, field
-from typing import List, Dict, Callable, Any
+from typing import List, Dict, Callable, Any, Set
 import time
 
 
 @dataclass
 class SessionState:
     sessionId: str
+
     scamDetected: bool = False
     scamType: str = "unknown"
     stage: str = "HOOK"  # HOOK / FRICTION / EXTRACT / VERIFY / EXIT
+
+    # counts incoming unique events (after dedupe)
     turnCount: int = 0
 
     completed: bool = False
@@ -26,18 +29,22 @@ class SessionState:
 
     # anti-loop + realism controls
     personaSeed: int = 0
-    lastIntent: str = ""  # e.g., "ASK_UPI", "ASK_BANK", "ASK_LINK", ...
-    repeatIntentCount: int = 0  # repeated same intent consecutively
-    usedExcuses: List[str] = field(default_factory=list)  # avoid repeating same excuse
+    lastIntent: str = ""
+    repeatIntentCount: int = 0
+    usedExcuses: List[str] = field(default_factory=list)
+
+    # dedupe protection
+    seenFingerprints: Set[str] = field(default_factory=set)
+
+    # useful for callback "both sides" counting
+    lastHistoryLen: int = 0
 
     lastUpdated: float = field(default_factory=time.time)
 
     def should_complete(self) -> bool:
         """
-        Goal:
-        - Avoid ending too early (aim ~12–18 turns).
-        - Still guarantee callback eventually (hard stop).
-        - Finish earlier only if we already extracted rich intel (3+ categories).
+        Aim for 12–18 turns unless we already got rich intel.
+        Hard stop ensures callback will happen.
         """
         categories = 0
         categories += 1 if self.upiIds else 0
@@ -45,8 +52,9 @@ class SessionState:
         categories += 1 if self.phishingLinks else 0
         categories += 1 if self.phoneNumbers else 0
         categories += 1 if self.ifscCodes else 0
+        categories += 1 if self.beneficiaryNames else 0
 
-        # If we have rich intel, can finish earlier but still not too early
+        # If rich intel (3+ categories), allow earlier finish but not too early
         if categories >= 3 and self.turnCount >= 10:
             return True
 
@@ -58,44 +66,51 @@ class SessionState:
         if categories >= 1 and self.turnCount >= 16:
             return True
 
-        # Hard stop to always trigger callback for scoring
+        # Hard stop to always trigger callback
         if self.turnCount >= 18:
             return True
 
         return False
 
+    def total_messages_exchanged(self) -> int:
+        """
+        GUVI-friendly: count BOTH sides based on history.
+        total = previous history + current incoming + our outgoing
+        """
+        return int(self.lastHistoryLen) + 2
+
     def build_callback_payload(self) -> Dict[str, Any]:
+        """
+        STRICT schema: only the keys GUVI expects.
+        Do NOT include extra keys in extractedIntelligence.
+        """
         return {
             "sessionId": self.sessionId,
             "scamDetected": self.scamDetected,
-            "totalMessagesExchanged": self.turnCount,
+            "totalMessagesExchanged": self.total_messages_exchanged(),
             "extractedIntelligence": {
                 "bankAccounts": self.bankAccounts,
                 "upiIds": self.upiIds,
                 "phishingLinks": self.phishingLinks,
                 "phoneNumbers": self.phoneNumbers,
                 "suspiciousKeywords": self.suspiciousKeywords,
-                # extra fields (safe, GUVI usually ignores unknown keys)
-                "ifscCodes": self.ifscCodes,
-                "beneficiaryNames": self.beneficiaryNames,
             },
             "agentNotes": (
                 "Scam conversation engagement completed. "
                 f"scamType={self.scamType}, stage={self.stage}, "
-                f"items={len(self.upiIds)+len(self.bankAccounts)+len(self.phishingLinks)+len(self.phoneNumbers)+len(self.ifscCodes)}"
+                f"items={len(self.upiIds)+len(self.bankAccounts)+len(self.phishingLinks)+len(self.phoneNumbers)}"
             ),
         }
 
 
 # -------------------------
-# In-memory store (OK for hackathon; swap to Redis later)
+# In-memory store
 # -------------------------
 _STORE: Dict[str, SessionState] = {}
 
 
 def load_session(session_id: str) -> SessionState:
     if session_id not in _STORE:
-        # deterministic-ish seed to vary persona per session
         seed = abs(hash(session_id)) % 3
         _STORE[session_id] = SessionState(sessionId=session_id, personaSeed=seed)
     return _STORE[session_id]
@@ -127,11 +142,18 @@ def rebuild_from_history(
 ) -> None:
     """
     Rebuild state if Render slept/restarted and memory got wiped.
+    Only merges extracted items from history text.
     """
-    # +1 because current incoming message will also be counted in app.py
-    state.turnCount = max(state.turnCount, len(history) + 1)
+    if not isinstance(history, list):
+        return
+
+    # state.turnCount will be incremented in app.py after dedupe,
+    # but we set a baseline so it doesn't start from zero after restart.
+    state.turnCount = max(state.turnCount, len(history) // 2)
 
     for m in history:
+        if not isinstance(m, dict):
+            continue
         text = (m.get("text") or "").strip()
         if not text:
             continue
@@ -149,7 +171,6 @@ def rebuild_from_history(
             vals = extracted.get(k, []) or []
             if not vals:
                 continue
-
             current = getattr(state, k, [])
             for v in vals:
                 if v not in current:

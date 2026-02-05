@@ -14,24 +14,12 @@ from callback_reporter import try_send_final_callback
 app = FastAPI()
 
 
-# -------------------------
-# Helpers (GUVI-friendly responses)
-# -------------------------
 def ok_reply(text: str) -> Dict[str, str]:
-    # Required hackathon output format
     return {"status": "success", "reply": text}
 
 
-def soft_bad_body_reply() -> JSONResponse:
-    """
-    GUVI tester sometimes sends a weird/empty JSON.
-    We must NOT crash or return 422.
-    Also: don't send 'INVALID_REQUEST_BODY' (it pollutes the conversation).
-    """
-    return JSONResponse(
-        status_code=200,
-        content=ok_reply("Hi, I didn’t get the full message text. Please resend the exact SMS content."),
-    )
+def invalid_request_body() -> JSONResponse:
+    return JSONResponse(status_code=200, content=ok_reply("INVALID_REQUEST_BODY"))
 
 
 def unauthorized() -> JSONResponse:
@@ -41,73 +29,83 @@ def unauthorized() -> JSONResponse:
     )
 
 
-# -------------------------
-# Health check
-# -------------------------
+def _fingerprint_message(msg: Dict[str, Any]) -> str:
+    """
+    Make a stable fingerprint for dedupe.
+    GUVI may resend the same event; we must ignore duplicates.
+    """
+    sender = (msg.get("sender") or "").strip().lower()
+    text = (msg.get("text") or "").strip()
+    ts = (msg.get("timestamp") or "").strip()
+    return f"{sender}|{ts}|{text}"
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
 
 
-# -------------------------
-# Main honeypot endpoint
-# -------------------------
 @app.post("/honeypot")
 async def honeypot(
     request: Request,
     x_api_key: Optional[str] = Header(None, alias="x-api-key"),
 ):
-    # 1) Auth (must be header: x-api-key)
+    # 1) Auth
     if not API_KEY or x_api_key != API_KEY:
         return unauthorized()
 
-    # 2) Parse body safely (NO 422)
+    # 2) Parse JSON safely (avoid FastAPI 422)
     try:
         payload = await request.json()
     except Exception:
-        return soft_bad_body_reply()
+        return invalid_request_body()
 
     if not isinstance(payload, dict):
-        return soft_bad_body_reply()
+        return invalid_request_body()
 
     # 3) Read fields safely
     session_id = payload.get("sessionId")
     message = payload.get("message") or {}
-    if not isinstance(message, dict):
-        return soft_bad_body_reply()
-
-    msg_text = (message.get("text") or "").strip()
-
     history = payload.get("conversationHistory") or []
     metadata = payload.get("metadata") or {}
 
-    # If GUVI sends incomplete body, don't crash or 400
+    msg_text = (message.get("text") or "").strip()
+
+    # If GUVI sends incomplete body, respond gracefully
     if not session_id or not msg_text:
-        return ok_reply("I didn’t receive the full message. Please resend the exact text you got.")
-
-    # Normalize history: must be list[dict]
-    if not isinstance(history, list):
-        history = []
-    history = [h for h in history if isinstance(h, dict)]
-
-    if not isinstance(metadata, dict):
-        metadata = {}
+        return ok_reply("Please resend the message text (content missing).")
 
     # 4) Load session
     state = load_session(session_id)
 
-    # If server restarted and GUVI sends conversationHistory, rebuild state
-    if is_fresh_state(state) and history:
+    # 5) Rebuild after restart if history exists
+    if is_fresh_state(state) and isinstance(history, list) and history:
         rebuild_from_history(state, history, extract_all)
 
-    # 5) Count turns (one per incoming request)
+    # 6) Dedupe repeated event (do NOT increment turnCount or re-extract)
+    fp = _fingerprint_message(message)
+    if fp and fp in state.seenFingerprints:
+        # Return a safe neutral reply (do not change state)
+        return ok_reply("Okay. Please share the next step.")
+
+    if fp:
+        state.seenFingerprints.add(fp)
+
+    # 7) Count turns (incoming requests only, after dedupe)
     state.turnCount = (state.turnCount or 0) + 1
 
-    # 6) Extract intelligence from incoming message
+    # 8) Extract intel from CURRENT incoming message only
     extracted = extract_all(msg_text)
 
-    # Merge extracted fields into state
-    for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers", "ifscCodes", "beneficiaryNames"]:
+    # Merge extracted lists uniquely into state
+    for k in [
+        "upiIds",
+        "bankAccounts",
+        "phishingLinks",
+        "phoneNumbers",
+        "ifscCodes",
+        "beneficiaryNames",
+    ]:
         vals = extracted.get(k, []) or []
         if not vals:
             continue
@@ -121,34 +119,36 @@ async def honeypot(
         if w not in state.suspiciousKeywords:
             state.suspiciousKeywords.append(w)
 
-    # 7) Detect scam intent (only once per session)
+    # 9) Detect scam intent once per session
     if not state.scamDetected:
         det = detect_scam(msg_text, history, metadata)
         state.scamDetected = bool(det.get("scamDetected", False))
         state.scamType = det.get("scamType", "unknown")
-
         for kw in det.get("keywords", []) or []:
             if kw not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(kw)
 
-    # 8) Agent reply
+    # 10) Agent reply
     if state.scamDetected:
         reply, updates = next_reply(state, msg_text, history, metadata)
         state.stage = updates.get("stage", state.stage)
     else:
         reply = "Okay. Can you share more details?"
 
-    # 9) Mandatory callback when ready
+    # 11) Mandatory callback when ready
+    # Use GUVI-style "both sides" total for callback payload
+    history_len = len(history) if isinstance(history, list) else 0
+    state.lastHistoryLen = history_len
     try_send_final_callback(state)
 
-    # 10) Save state
+    # 12) Save
     save_session(state)
 
     return ok_reply(reply)
 
 
 # -------------------------
-# Debug routes (disable in prod)
+# Debug routes (dev only)
 # -------------------------
 if ENV != "prod":
 
@@ -175,8 +175,8 @@ if ENV != "prod":
                 "bankAccounts": state.bankAccounts,
                 "phishingLinks": state.phishingLinks,
                 "phoneNumbers": state.phoneNumbers,
-                "ifscCodes": getattr(state, "ifscCodes", []),
-                "beneficiaryNames": getattr(state, "beneficiaryNames", []),
+                "ifscCodes": state.ifscCodes,
+                "beneficiaryNames": state.beneficiaryNames,
                 "suspiciousKeywords": state.suspiciousKeywords,
             },
         }

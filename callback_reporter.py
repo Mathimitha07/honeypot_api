@@ -29,7 +29,12 @@ def try_send_final_callback(state: SessionState) -> None:
     payload = state.build_callback_payload()
 
     try:
-        resp = requests.post(CALLBACK_URL, json=payload, timeout=8)
+        resp = requests.post(
+            CALLBACK_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=8,
+        )
 
         if 200 <= resp.status_code < 300:
             state.completed = True

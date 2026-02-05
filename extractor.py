@@ -2,10 +2,10 @@
 import re
 from typing import Dict, List
 
-# URLs (we will strip trailing punctuation)
+# URLs (we'll strip trailing punctuation)
 URL_RE = re.compile(r"https?://[^\s)>\"]+", re.IGNORECASE)
 
-# India phone: capture core 10-digit mobile starting 6-9 (optional +91 prefix)
+# India phone: capture core 10-digit mobile starting 6-9
 PHONE_RE = re.compile(r"(?:\+?91[\s-]?)?([6-9]\d{9})")
 
 # UPI id
@@ -17,14 +17,12 @@ IFSC_RE = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b")
 # Bank account strict (continuous digits 11-18)
 BANK_RE = re.compile(r"\b\d{11,18}\b")
 
-# Lax bank: spaced/hyphenated digits -> normalize and validate length
-# Example: "1234 5678 9012 3456" -> "1234567890123456"
+# Lax bank: spaced/hyphenated digits => normalize and validate length
 BANK_LAX_RE = re.compile(r"\b(?:\d[\s-]?){11,22}\b")
 
-# Beneficiary name patterns (simple but useful)
-# Captures after "beneficiary:" / "beneficiary name is" / "name will show as"
+# Beneficiary name (supports: "Beneficiary: Rahul Sharma" / "beneficiary name is FakeBank Ltd")
 BENEF_RE = re.compile(
-    r"\b(?:beneficiary(?:\s+name)?|name)\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z .]{1,50})['\"]?",
+    r"\b(?:beneficiary(?:\s*name)?|payee(?:\s*name)?|name)\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z0-9 &().\-]{1,60})['\"]?",
     re.IGNORECASE,
 )
 
@@ -52,49 +50,42 @@ def _digits_only(s: str) -> str:
 
 
 def _clean_url(u: str) -> str:
-    # remove trailing punctuation like . , ; ) ]
     return (u or "").rstrip(").,;]>\"'")
+
+
+def _clean_beneficiary(name: str) -> str:
+    n = (name or "").strip()
+    # cut off if it accidentally captures extra info
+    n = re.sub(r"\s+(ifsc|upi|account|otp)\b.*$", "", n, flags=re.IGNORECASE).strip()
+    # collapse spaces
+    n = re.sub(r"\s{2,}", " ", n).strip()
+    return n
 
 
 def extract_all(text: str) -> Dict[str, List[str]]:
     t = (text or "").strip()
     lower = t.lower()
 
-    # URLs (clean)
     phishing_links = _unique([_clean_url(u) for u in URL_RE.findall(t)])
 
-    # Phones (10-digit core)
     phones = _unique(PHONE_RE.findall(t))
-    phone_set = set(phones)
 
-    # UPI IDs
     upis = _unique(UPI_RE.findall(t))
 
-    # IFSC codes (normalize to uppercase)
-    ifscs = _unique([m.group(0).upper() for m in IFSC_RE.finditer(t.upper())])
+    ifscs = _unique([m.group(0) for m in IFSC_RE.finditer(t.upper())])
 
-    # Beneficiary names (FIXED variable + better cleanup)
+    # Beneficiary names
     beneficiary = []
     for m in BENEF_RE.finditer(t):
-        name = (m.group(1) or "").strip()
-
-        # Cleanup: stop at common trailing fields
-        name = re.split(r"\b(?:ifsc|upi|account|otp|link)\b", name, flags=re.IGNORECASE)[0].strip()
-        name = name.strip(" -:,;")
-
-        # Avoid capturing overly short / generic junk
-        if len(name) >= 2 and len(name) <= 50:
+        name = _clean_beneficiary(m.group(1))
+        if len(name) >= 2:
             beneficiary.append(name)
-
     beneficiary = _unique(beneficiary)
 
-    # Bank accounts:
-    banks = []
-
-    # 1) continuous digits (11-18)
+    # Bank accounts
+    banks: List[str] = []
     banks += BANK_RE.findall(t)
 
-    # 2) spaced/hyphenated -> normalize -> keep 11-18
     for raw in BANK_LAX_RE.findall(t):
         d = _digits_only(raw)
         if 11 <= len(d) <= 18:
@@ -102,19 +93,17 @@ def extract_all(text: str) -> Dict[str, List[str]]:
 
     banks = _unique(banks)
 
-    # Remove anything that is actually a phone number in disguise:
-    # - never keep 10-digit phones as bank
-    # - if 12 digits startswith 91 and last10 is a phone, drop it (e.g., 919876543210)
+    # Remove "91"+"phone" being misread as bank (e.g., 919876543210)
+    phone_set = set(phones)
     cleaned_banks = []
     for b in banks:
-        if len(b) == 10 and b in phone_set:
-            continue
         if len(b) == 12 and b.startswith("91") and b[-10:] in phone_set:
+            continue
+        if len(b) == 10 and b in phone_set:
             continue
         cleaned_banks.append(b)
     banks = cleaned_banks
 
-    # Keywords
     suspicious = _unique([k for k in KEYWORDS if k in lower])
 
     return {
