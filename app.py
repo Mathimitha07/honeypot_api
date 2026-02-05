@@ -1,8 +1,8 @@
 # app.py
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field, ConfigDict
+from fastapi import FastAPI, Header, HTTPException, Body
+from fastapi.responses import JSONResponse
 
 from config import API_KEY, CALLBACK_URL, ENV
 from session_store import load_session, save_session, is_fresh_state, rebuild_from_history
@@ -13,24 +13,17 @@ from callback_reporter import try_send_final_callback
 
 app = FastAPI()
 
-
 # -------------------------
-# Pydantic models (this fixes GUVI INVALID_REQUEST_BODY)
+# Helpers
 # -------------------------
-class Message(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    sender: Optional[str] = None
-    text: str
-    timestamp: Optional[str] = None
+def unauthorized():
+    return JSONResponse(
+        status_code=401,
+        content={"status": "error", "message": "UNAUTHORIZED", "errorCode": "E401"},
+    )
 
-
-class HoneypotPayload(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    sessionId: str
-    message: Message
-    conversationHistory: List[Message] = Field(default_factory=list)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
+def ok_reply(text: str):
+    return {"status": "success", "reply": text}
 
 # -------------------------
 # Health check
@@ -39,106 +32,99 @@ class HoneypotPayload(BaseModel):
 def root():
     return {"status": "ok"}
 
-
 # -------------------------
-# Main endpoint (GUVI will call this)
+# Main endpoint
+# IMPORTANT: payload is Any to avoid FastAPI 422
 # -------------------------
 @app.post("/honeypot")
 def honeypot(
-    payload: HoneypotPayload,
+    payload: Any = Body(None),
     x_api_key: Optional[str] = Header(None, alias="x-api-key"),
 ):
-    # Auth
+    # 1) Auth
     if not API_KEY or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        return unauthorized()
 
-    session_id = payload.sessionId
-    msg_text = (payload.message.text or "").strip()
-    history = payload.conversationHistory or []
-    metadata = payload.metadata or {}
+    # 2) GUVI tester sometimes sends a string body or empty body.
+    #    Do NOT allow 422; handle gracefully.
+    if payload is None:
+        return ok_reply("Hi. Please share the message you received.")
+    if not isinstance(payload, dict):
+        # Example: payload == "string"
+        return ok_reply("Please resend the message text you received so I can help.")
 
-    # Load state
+    # 3) Extract required fields safely
+    session_id = payload.get("sessionId")
+    message = payload.get("message") or {}
+    msg_text = (message.get("text") or "").strip()
+
+    history = payload.get("conversationHistory") or []
+    metadata = payload.get("metadata") or {}
+
+    # If missing key fields, still respond success (tester should not fail)
+    if not session_id or not msg_text:
+        return ok_reply("I didn’t receive the full message. Please resend the exact text you got.")
+
+    # 4) Load state
     state = load_session(session_id)
 
-    # If server restarted and memory is empty, rebuild from history
-    if is_fresh_state(state) and history:
-        # Convert Message models -> dicts for your rebuild function
-        history_dicts = [m.model_dump() for m in history]
-        rebuild_from_history(state, history_dicts, extract_all)
+    # If memory lost and history exists, rebuild
+    if is_fresh_state(state) and isinstance(history, list) and history:
+        rebuild_from_history(state, history, extract_all)
 
-    # Count turn (1 per incoming request)
+    # Count turns (one per request)
     state.turnCount = (state.turnCount or 0) + 1
 
-    # Extract intelligence from incoming message
+    # 5) Extract intelligence
     extracted = extract_all(msg_text)
 
     for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
         vals = extracted.get(k, []) or []
-        if not vals:
-            continue
-        current = getattr(state, k, [])
-        for v in vals:
-            if v not in current:
-                current.append(v)
-        setattr(state, k, current)
+        if vals:
+            current = getattr(state, k, [])
+            for v in vals:
+                if v not in current:
+                    current.append(v)
+            setattr(state, k, current)
 
     for w in extracted.get("suspiciousKeywords", []) or []:
         if w not in state.suspiciousKeywords:
             state.suspiciousKeywords.append(w)
 
-    # Detect scam intent (only once)
+    # 6) Scam detection (once per session)
     if not state.scamDetected:
-        # Convert Message models -> dicts for detector
-        history_dicts = [m.model_dump() for m in history]
-        det = detect_scam(msg_text, history_dicts, metadata)
-        state.scamDetected = bool(det.get("scamDetected", False))
+        det = detect_scam(msg_text, history, metadata)
+        state.scamDetected = det.get("scamDetected", False)
         state.scamType = det.get("scamType", "unknown")
 
         for kw in det.get("keywords", []) or []:
             if kw not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(kw)
 
-    # Agent reply
+    # 7) Reply generation
     if state.scamDetected:
-        # Convert Message models -> dicts for agent
-        history_dicts = [m.model_dump() for m in history]
-        reply, updates = next_reply(state, msg_text, history_dicts, metadata)
+        reply, updates = next_reply(state, msg_text, history, metadata)
         state.stage = updates.get("stage", state.stage)
     else:
-        reply = "Sorry, I didn’t understand. Can you explain?"
+        reply = "Okay. Can you share more details?"
 
-    # Callback when complete
+    # 8) Mandatory final callback (when complete)
     try_send_final_callback(state)
 
-    # Save state
+    # Save session
     save_session(state)
 
-    # Required output format
     return {"status": "success", "reply": reply}
 
-
 # -------------------------
-# Debug routes (DEV only)
+# Debug routes only if not prod
 # -------------------------
 if ENV != "prod":
 
-    @app.post("/debug/extract")
-    def debug_extract(
-        payload: Dict[str, Any],
-        x_api_key: Optional[str] = Header(None, alias="x-api-key"),
-    ):
-        if not API_KEY or x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        text = (payload.get("text") or "").strip()
-        return extract_all(text)
-
     @app.get("/debug/session/{session_id}")
-    def debug_session(
-        session_id: str,
-        x_api_key: Optional[str] = Header(None, alias="x-api-key"),
-    ):
+    def debug_session(session_id: str, x_api_key: Optional[str] = Header(None, alias="x-api-key")):
         if not API_KEY or x_api_key != API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+            return unauthorized()
 
         state = load_session(session_id)
         return {
