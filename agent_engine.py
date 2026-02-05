@@ -4,69 +4,20 @@ from extractor import extract_all
 
 
 def next_reply(state, msg_text: str, history, metadata) -> Tuple[str, Dict[str, Any]]:
-    """
-    Agentic reply engine.
-
-    IMPORTANT:
-    - turnCount is incremented in app.py (one per incoming request).
-    - This function only decides: reply + stage updates.
-    """
-
     extracted = extract_all(msg_text)
 
-    # If already completed, keep it short & safe
     if state.completed:
         state.stage = "EXIT"
         return "Okay. I’m checking it now. Please wait.", {"stage": state.stage}
 
     # -------------------------
-    # React FIRST to intel in this message (priority)
+    # 1) React to intel (priority)
     # -------------------------
 
-    # UPI present -> ask once, then pivot to new intel instead of repeating
-    if extracted.get("upiIds"):
-        incoming_upis = extracted.get("upiIds") or []
-        already_known = all(u in state.upiIds for u in incoming_upis)
-
-        if already_known:
-            state.upiRepeatCount += 1
-        else:
-            state.upiRepeatCount = 0
-
-        state.stage = "VERIFY"
-
-        # If scammer keeps repeating same UPI, pivot hard
-        if state.upiRepeatCount >= 1:
-            return (
-                "Okay I saved that. What beneficiary name should I see while paying, and do you have an alternate UPI or bank account + IFSC?",
-                {"stage": state.stage},
-            )
-
-        return (
-            "Please send the exact UPI ID again (including the @ part). I think I typed it wrong.",
-            {"stage": state.stage},
-        )
-
-    # Bank account present -> ask to resend clearly (human error)
-    if extracted.get("bankAccounts"):
-        state.stage = "VERIFY"
-        return (
-            "Can you resend the bank account number again? Please type it with spaces so I can copy correctly. Also share IFSC.",
-            {"stage": state.stage},
-        )
-
-    # Phone number present -> confirm last digits
-    if extracted.get("phoneNumbers"):
-        state.stage = "VERIFY"
-        return (
-            "I saved the number but I’m not sure the last digits are right. Can you confirm the last 2 digits and the name of the person I should ask for?",
-            {"stage": state.stage},
-        )
-
-    # Link present -> ask once, then pivot to steps/alternate link
+    # Link appeared
     if extracted.get("phishingLinks"):
-        incoming_links = extracted.get("phishingLinks") or []
-        already_known = all(l in state.phishingLinks for l in incoming_links)
+        incoming = extracted.get("phishingLinks") or []
+        already_known = all(l in state.phishingLinks for l in incoming)
 
         if already_known:
             state.linkRepeatCount += 1
@@ -77,7 +28,7 @@ def next_reply(state, msg_text: str, history, metadata) -> Tuple[str, Dict[str, 
 
         if state.linkRepeatCount >= 1:
             return (
-                "The link is opening slowly. Can you send a shorter link or the exact steps, and the official helpline number you want me to call?",
+                "That link is loading very slowly. Can you send a shorter link or the exact steps, and the official helpline number you want me to call?",
                 {"stage": state.stage},
             )
 
@@ -86,8 +37,78 @@ def next_reply(state, msg_text: str, history, metadata) -> Tuple[str, Dict[str, 
             {"stage": state.stage},
         )
 
+    # UPI appeared
+    if extracted.get("upiIds"):
+        incoming = extracted.get("upiIds") or []
+        already_known = all(u in state.upiIds for u in incoming)
+
+        if already_known:
+            state.upiRepeatCount += 1
+        else:
+            state.upiRepeatCount = 0
+
+        state.stage = "VERIFY"
+
+        # Ask beneficiary/alternate ONLY ONCE
+        if state.upiRepeatCount >= 1:
+            if not state.askedBeneficiary:
+                state.askedBeneficiary = True
+                return (
+                    "Okay I saved it. What beneficiary name should I see while paying?",
+                    {"stage": state.stage},
+                )
+            if not state.askedAlternate:
+                state.askedAlternate = True
+                return (
+                    "Do you have an alternate UPI ID or a bank account + IFSC in case this fails?",
+                    {"stage": state.stage},
+                )
+
+            # After asking both, pivot to “human mistake” flow (no repeating questions)
+            return (
+                "I’m getting a verification error on my side. Can you resend the bank account number + IFSC clearly (or the helpline number)?",
+                {"stage": state.stage},
+            )
+
+        return (
+            "Please send the exact UPI ID again (including the @ part). I think I typed it wrong.",
+            {"stage": state.stage},
+        )
+
+    # Bank account appeared
+    if extracted.get("bankAccounts"):
+        incoming = extracted.get("bankAccounts") or []
+        already_known = all(b in state.bankAccounts for b in incoming)
+
+        if already_known:
+            state.bankRepeatCount += 1
+        else:
+            state.bankRepeatCount = 0
+
+        state.stage = "VERIFY"
+
+        if state.bankRepeatCount >= 1:
+            # Don’t keep asking the same resend line
+            return (
+                "Thanks. What is the branch/region and the beneficiary name that should appear? Also share any alternate account/UPI.",
+                {"stage": state.stage},
+            )
+
+        return (
+            "Can you resend the bank account number again? Please type it with spaces so I can copy correctly. Also share IFSC.",
+            {"stage": state.stage},
+        )
+
+    # Phone number appeared
+    if extracted.get("phoneNumbers"):
+        state.stage = "VERIFY"
+        return (
+            "I saved the number but I’m not sure the last digits are right. Can you confirm the last 2 digits?",
+            {"stage": state.stage},
+        )
+
     # -------------------------
-    # Stage-based fallback when this message has no new intel
+    # 2) Stage fallback (no intel)
     # -------------------------
 
     if state.stage == "HOOK":
@@ -115,10 +136,9 @@ def next_reply(state, msg_text: str, history, metadata) -> Tuple[str, Dict[str, 
             return "Okay, I’m trying again now. Give me a minute.", {"stage": state.stage}
 
         return (
-            "It’s still not going through. Please resend the link and payment details again. If there’s an alternate UPI/bank account or helpline number, send that too.",
+            "It’s still not going through. Please resend link and payment details again. If there’s an alternate UPI/bank account or helpline number, send that too.",
             {"stage": state.stage},
         )
 
-    # EXIT / unknown
     state.stage = "EXIT"
     return "Okay.", {"stage": state.stage}
