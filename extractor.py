@@ -2,7 +2,7 @@
 import re
 from typing import Dict, List
 
-# URLs (we'll strip trailing punctuation)
+# URLs (strip trailing punctuation later)
 URL_RE = re.compile(r"https?://[^\s)>\"]+", re.IGNORECASE)
 
 # India phone: capture core 10-digit mobile starting 6-9
@@ -20,9 +20,9 @@ BANK_RE = re.compile(r"\b\d{11,18}\b")
 # Lax bank: spaced/hyphenated digits => normalize and validate length
 BANK_LAX_RE = re.compile(r"\b(?:\d[\s-]?){11,22}\b")
 
-# Beneficiary name (supports: "Beneficiary: Rahul Sharma" / "beneficiary name is FakeBank Ltd")
+# Beneficiary patterns (covers: "Beneficiary: X", "Beneficiary name is X", "will show as X")
 BENEF_RE = re.compile(
-    r"\b(?:beneficiary(?:\s*name)?|payee(?:\s*name)?|name)\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z0-9 &().\-]{1,60})['\"]?",
+    r"\bbeneficiary(?:\s+name)?\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z0-9 .&_-]{1,60})['\"]?",
     re.IGNORECASE,
 )
 
@@ -50,28 +50,33 @@ def _digits_only(s: str) -> str:
 
 
 def _clean_url(u: str) -> str:
+    # remove trailing punctuation like . , ; ) ] >
     return (u or "").rstrip(").,;]>\"'")
 
 
 def _clean_beneficiary(name: str) -> str:
-    n = (name or "").strip()
-    # cut off if it accidentally captures extra info
-    n = re.sub(r"\s+(ifsc|upi|account|otp)\b.*$", "", n, flags=re.IGNORECASE).strip()
-    # collapse spaces
-    n = re.sub(r"\s{2,}", " ", n).strip()
-    return n
+    name = (name or "").strip()
+    # stop at common trailing tokens that appear in same sentence
+    name = re.split(r"\b(ifsc|upi|account|otp|link|phone|number)\b", name, flags=re.IGNORECASE)[0].strip()
+    # drop trailing punctuation
+    name = name.rstrip(".,;:- ")
+    return name
 
 
 def extract_all(text: str) -> Dict[str, List[str]]:
     t = (text or "").strip()
     lower = t.lower()
 
+    # URLs
     phishing_links = _unique([_clean_url(u) for u in URL_RE.findall(t)])
 
+    # Phones (10-digit core)
     phones = _unique(PHONE_RE.findall(t))
 
+    # UPI
     upis = _unique(UPI_RE.findall(t))
 
+    # IFSC
     ifscs = _unique([m.group(0) for m in IFSC_RE.finditer(t.upper())])
 
     # Beneficiary names
@@ -82,8 +87,8 @@ def extract_all(text: str) -> Dict[str, List[str]]:
             beneficiary.append(name)
     beneficiary = _unique(beneficiary)
 
-    # Bank accounts
-    banks: List[str] = []
+    # Bank accounts:
+    banks = []
     banks += BANK_RE.findall(t)
 
     for raw in BANK_LAX_RE.findall(t):
@@ -93,7 +98,7 @@ def extract_all(text: str) -> Dict[str, List[str]]:
 
     banks = _unique(banks)
 
-    # Remove "91"+"phone" being misread as bank (e.g., 919876543210)
+    # Remove phone-like banks: 919876543210 -> +91 phone
     phone_set = set(phones)
     cleaned_banks = []
     for b in banks:
@@ -104,6 +109,7 @@ def extract_all(text: str) -> Dict[str, List[str]]:
         cleaned_banks.append(b)
     banks = cleaned_banks
 
+    # Keywords
     suspicious = _unique([k for k in KEYWORDS if k in lower])
 
     return {
