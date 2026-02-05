@@ -2,64 +2,43 @@
 import re
 from typing import Dict, List
 
-# -----------------------
-# URL (avoid trailing punctuation like . , ) ] )
-# -----------------------
+# URLs (we will strip trailing punctuation)
 URL_RE = re.compile(r"https?://[^\s)>\"]+", re.IGNORECASE)
 
-# -----------------------
-# India phone numbers:
-# captures the 10-digit core, optional +91 prefix
-# -----------------------
-PHONE_RE = re.compile(r"(?:\+?91[\s-]?)?([6-9]\d{9})\b")
+# India phone: capture core 10-digit mobile starting 6-9 (optional +91 prefix)
+PHONE_RE = re.compile(r"(?:\+?91[\s-]?)?([6-9]\d{9})")
 
-# -----------------------
-# UPI ID
-# -----------------------
+# UPI id
 UPI_RE = re.compile(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b")
 
-# -----------------------
-# IFSC code (11 chars, 1st 4 letters, 0, then 6 alnum)
-# Example: SBIN0001234
-# -----------------------
-IFSC_RE = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", re.IGNORECASE)
+# IFSC: 4 letters + 0 + 6 alnum (e.g., SBIN0001234)
+IFSC_RE = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b")
 
-# -----------------------
-# Bank account:
-# - strict continuous digits 11-18
-# - plus a lax spaced/hyphenated pattern that normalizes to 11-18
-# -----------------------
-BANK_STRICT_RE = re.compile(r"\b\d{11,18}\b")
+# Bank account strict (continuous digits 11-18)
+BANK_RE = re.compile(r"\b\d{11,18}\b")
 
-# Catch sequences like "1234 5678 9012 3456" or "1234-5678-9012-3456"
+# Lax bank: spaced/hyphenated digits -> normalize and validate length
+# Example: "1234 5678 9012 3456" -> "1234567890123456"
 BANK_LAX_RE = re.compile(r"\b(?:\d[\s-]?){11,22}\b")
 
-# -----------------------
-# Beneficiary name patterns (basic but useful)
-# e.g., "Beneficiary: Rahul Sharma"
-#       "Beneficiary name is 'SBI Support'"
-#       "beneficiary will show as SBI Support"
-# -----------------------
+# Beneficiary name patterns (simple but useful)
+# Captures after "beneficiary:" / "beneficiary name is" / "name will show as"
 BENEF_RE = re.compile(
-    r"\bbeneficiary(?:\s+name)?\s*(?:is|:|will\s+show\s+as)\s*['\"]?([A-Za-z][A-Za-z\s.\-]{2,40})['\"]?",
+    r"\b(?:beneficiary(?:\s+name)?|name)\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z .]{1,50})['\"]?",
     re.IGNORECASE,
 )
 
-# Common scam keywords
 KEYWORDS = [
     "urgent", "immediately", "verify", "blocked", "suspended", "kyc", "otp",
-    "account", "bank", "limit", "freeze", "locked", "click", "link", "payment",
-    "transfer", "fee", "support", "helpline"
+    "account", "bank", "limit", "freeze", "locked", "click", "link", "payment"
 ]
-
-# punctuation to trim from URLs (fix abc. / abc, / abc) etc.
-TRAILING_PUNCT = ".,;:)]}>\"'"
 
 
 def _unique(xs: List[str]) -> List[str]:
     seen = set()
     out = []
     for x in xs:
+        x = (x or "").strip()
         if not x:
             continue
         if x not in seen:
@@ -73,49 +52,49 @@ def _digits_only(s: str) -> str:
 
 
 def _clean_url(u: str) -> str:
-    # remove trailing punctuation safely
-    if not u:
-        return u
-    while u and u[-1] in TRAILING_PUNCT:
-        u = u[:-1]
-    return u
+    # remove trailing punctuation like . , ; ) ]
+    return (u or "").rstrip(").,;]>\"'")
 
 
 def extract_all(text: str) -> Dict[str, List[str]]:
-    text = text or ""
-    t = text.strip()
+    t = (text or "").strip()
     lower = t.lower()
 
-    # URLs cleaned (fix trailing dot issue)
-    phishing_links = [_clean_url(u) for u in URL_RE.findall(t)]
-    phishing_links = _unique([u for u in phishing_links if u])
+    # URLs (clean)
+    phishing_links = _unique([_clean_url(u) for u in URL_RE.findall(t)])
 
     # Phones (10-digit core)
     phones = _unique(PHONE_RE.findall(t))
+    phone_set = set(phones)
 
     # UPI IDs
     upis = _unique(UPI_RE.findall(t))
 
-    # IFSC codes (normalize upper)
-    ifscs = _unique([x.upper() for x in IFSC_RE.findall(t)])
+    # IFSC codes (normalize to uppercase)
+    ifscs = _unique([m.group(0).upper() for m in IFSC_RE.finditer(t.upper())])
 
-    # Beneficiary names
-    beneficiaries = []
-    for m in BENEF_RE.findall(t):
-        name = (m or "").strip()
-        # basic cleanup
-        name = re.sub(r"\s+", " ", name)
-        if name and len(name) <= 40:
-            beneficiaries.append(name)
-    beneficiaries = _unique(beneficiaries)
+    # Beneficiary names (FIXED variable + better cleanup)
+    beneficiary = []
+    for m in BENEF_RE.finditer(t):
+        name = (m.group(1) or "").strip()
 
-    # Bank accounts
+        # Cleanup: stop at common trailing fields
+        name = re.split(r"\b(?:ifsc|upi|account|otp|link)\b", name, flags=re.IGNORECASE)[0].strip()
+        name = name.strip(" -:,;")
+
+        # Avoid capturing overly short / generic junk
+        if len(name) >= 2 and len(name) <= 50:
+            beneficiary.append(name)
+
+    beneficiary = _unique(beneficiary)
+
+    # Bank accounts:
     banks = []
 
-    # 1) strict continuous digits
-    banks.extend(BANK_STRICT_RE.findall(t))
+    # 1) continuous digits (11-18)
+    banks += BANK_RE.findall(t)
 
-    # 2) spaced/hyphenated -> normalize digits -> keep if 11-18 digits
+    # 2) spaced/hyphenated -> normalize -> keep 11-18
     for raw in BANK_LAX_RE.findall(t):
         d = _digits_only(raw)
         if 11 <= len(d) <= 18:
@@ -123,19 +102,17 @@ def extract_all(text: str) -> Dict[str, List[str]]:
 
     banks = _unique(banks)
 
-    # -----------------------
-    # Critical safety filters
-    # -----------------------
-
-    # (A) never treat phone numbers as bank accounts
-    banks = [b for b in banks if b not in phones]
-
-    # (B) never treat "+91" + phone (12 digits like 919876543210) as bank account
-    phone12 = {"91" + p for p in phones}
-    banks = [b for b in banks if b not in phone12]
-
-    # (C) if a "bank" number is exactly 12 digits and starts with 91, reject (very likely phone)
-    banks = [b for b in banks if not (len(b) == 12 and b.startswith("91"))]
+    # Remove anything that is actually a phone number in disguise:
+    # - never keep 10-digit phones as bank
+    # - if 12 digits startswith 91 and last10 is a phone, drop it (e.g., 919876543210)
+    cleaned_banks = []
+    for b in banks:
+        if len(b) == 10 and b in phone_set:
+            continue
+        if len(b) == 12 and b.startswith("91") and b[-10:] in phone_set:
+            continue
+        cleaned_banks.append(b)
+    banks = cleaned_banks
 
     # Keywords
     suspicious = _unique([k for k in KEYWORDS if k in lower])
@@ -146,6 +123,6 @@ def extract_all(text: str) -> Dict[str, List[str]]:
         "phishingLinks": phishing_links,
         "phoneNumbers": phones,
         "ifscCodes": ifscs,
-        "beneficiaryNames": beneficiaries,
+        "beneficiaryNames": beneficiary,
         "suspiciousKeywords": suspicious,
     }
