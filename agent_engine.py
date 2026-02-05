@@ -3,142 +3,94 @@ from typing import Tuple, Dict, Any
 from extractor import extract_all
 
 
+def _persona_line(state) -> str:
+    # small human excuse once in a while (not every turn)
+    if state.turnCount in (2, 5, 8):
+        if state.personaSeed == 0:
+            return "I’m outside and my network is weak. "
+        if state.personaSeed == 1:
+            return "I’m using my mother’s phone and things are slow. "
+        return "My UPI app is lagging right now. "
+    return ""
+
+
 def next_reply(state, msg_text: str, history, metadata) -> Tuple[str, Dict[str, Any]]:
     extracted = extract_all(msg_text)
 
+    # If already completed, keep safe and stop engagement
     if state.completed:
         state.stage = "EXIT"
         return "Okay. I’m checking it now. Please wait.", {"stage": state.stage}
 
-    # -------------------------
-    # 1) React to intel (priority)
-    # -------------------------
-
-    # Link appeared
+    # If scammer sends fresh intel, react and also ask for MORE fields (bank+IFSC / phone / beneficiary)
     if extracted.get("phishingLinks"):
-        incoming = extracted.get("phishingLinks") or []
-        already_known = all(l in state.phishingLinks for l in incoming)
-
-        if already_known:
-            state.linkRepeatCount += 1
-        else:
-            state.linkRepeatCount = 0
-
         state.stage = "FRICTION"
+        state.frictionRepeatCount += 1
+        prefix = _persona_line(state)
+        if state.frictionRepeatCount == 1:
+            return prefix + "That link is loading very slowly. Can you send a shorter link or the exact steps, and the official helpline number you want me to call?", {"stage": state.stage}
+        return prefix + "It says invalid on my phone. Please resend the exact link without any extra symbols, and share the support number to call back.", {"stage": state.stage}
 
-        if state.linkRepeatCount >= 1:
-            return (
-                "That link is loading very slowly. Can you send a shorter link or the exact steps, and the official helpline number you want me to call?",
-                {"stage": state.stage},
-            )
-
-        return (
-            "I tried opening it but it’s not working on my phone. Can you resend the exact link again?",
-            {"stage": state.stage},
-        )
-
-    # UPI appeared
     if extracted.get("upiIds"):
-        incoming = extracted.get("upiIds") or []
-        already_known = all(u in state.upiIds for u in incoming)
-
-        if already_known:
-            state.upiRepeatCount += 1
-        else:
-            state.upiRepeatCount = 0
-
         state.stage = "VERIFY"
+        state.verifyRepeatCount += 1
+        prefix = _persona_line(state)
 
-        # Ask beneficiary/alternate ONLY ONCE
-        if state.upiRepeatCount >= 1:
-            if not state.askedBeneficiary:
-                state.askedBeneficiary = True
-                return (
-                    "Okay I saved it. What beneficiary name should I see while paying?",
-                    {"stage": state.stage},
-                )
-            if not state.askedAlternate:
-                state.askedAlternate = True
-                return (
-                    "Do you have an alternate UPI ID or a bank account + IFSC in case this fails?",
-                    {"stage": state.stage},
-                )
+        # Rotate tactics instead of repeating the same line
+        if state.verifyRepeatCount == 1:
+            return prefix + "Please confirm the exact UPI handle (like @ybl / @okhdfcbank / @paytm). My app is showing a mismatch.", {"stage": state.stage}
+        if state.verifyRepeatCount == 2:
+            return prefix + "My UPI app shows ‘Name mismatch’. What beneficiary name should I see while paying?", {"stage": state.stage}
+        return prefix + "If UPI fails, can I do bank transfer instead? Share account number + IFSC and the beneficiary name.", {"stage": state.stage}
 
-            # After asking both, pivot to “human mistake” flow (no repeating questions)
-            return (
-                "I’m getting a verification error on my side. Can you resend the bank account number + IFSC clearly (or the helpline number)?",
-                {"stage": state.stage},
-            )
-
-        return (
-            "Please send the exact UPI ID again (including the @ part). I think I typed it wrong.",
-            {"stage": state.stage},
-        )
-
-    # Bank account appeared
     if extracted.get("bankAccounts"):
-        incoming = extracted.get("bankAccounts") or []
-        already_known = all(b in state.bankAccounts for b in incoming)
-
-        if already_known:
-            state.bankRepeatCount += 1
-        else:
-            state.bankRepeatCount = 0
-
         state.stage = "VERIFY"
+        state.verifyRepeatCount += 1
+        prefix = _persona_line(state)
 
-        if state.bankRepeatCount >= 1:
-            # Don’t keep asking the same resend line
-            return (
-                "Thanks. What is the branch/region and the beneficiary name that should appear? Also share any alternate account/UPI.",
-                {"stage": state.stage},
-            )
+        if state.verifyRepeatCount == 1:
+            return prefix + "Can you resend the bank account number with spaces so I can copy correctly? Also share IFSC.", {"stage": state.stage}
+        if state.verifyRepeatCount == 2:
+            return prefix + "Which branch/region is this and what beneficiary name should appear? Also send an alternate account/UPI if you have.", {"stage": state.stage}
+        return prefix + "If the bank transfer fails, what number should I call back? This message came from an unknown sender.", {"stage": state.stage}
 
-        return (
-            "Can you resend the bank account number again? Please type it with spaces so I can copy correctly. Also share IFSC.",
-            {"stage": state.stage},
-        )
-
-    # Phone number appeared
     if extracted.get("phoneNumbers"):
         state.stage = "VERIFY"
-        return (
-            "I saved the number but I’m not sure the last digits are right. Can you confirm the last 2 digits?",
-            {"stage": state.stage},
-        )
+        prefix = _persona_line(state)
+        return prefix + "Okay saved. Before I call, confirm the department name and the last 2 digits so I don’t call the wrong number.", {"stage": state.stage}
 
-    # -------------------------
-    # 2) Stage fallback (no intel)
-    # -------------------------
+    # No new intel in this message: stage-based conversation flow
+    prefix = _persona_line(state)
 
     if state.stage == "HOOK":
         state.stage = "FRICTION"
-        return "Why is it getting blocked? What should I do right now?", {"stage": state.stage}
+        return prefix + "Why is it getting blocked? What should I do right now?", {"stage": state.stage}
 
     if state.stage == "FRICTION":
         state.stage = "EXTRACT"
-        return (
-            "I’m confused. Please send the exact verification link and payment details again (UPI or bank + IFSC).",
-            {"stage": state.stage},
-        )
+        return prefix + "I’m confused. Please send the exact verification link and payment details again (UPI or bank + IFSC).", {"stage": state.stage}
 
     if state.stage == "EXTRACT":
         state.stage = "VERIFY"
-        return (
-            "Okay. Send the verification link plus payment detail (UPI ID or bank account + IFSC) in one message.",
-            {"stage": state.stage},
-        )
+        return prefix + "Okay. Send the link, then the payment details (UPI or bank + IFSC) and the beneficiary name in one message.", {"stage": state.stage}
 
     if state.stage == "VERIFY":
+        # if completion achieved, end naturally (don’t invite more)
         if state.should_complete():
             state.completed = True
             state.stage = "EXIT"
             return "Okay, I’m trying again now. Give me a minute.", {"stage": state.stage}
 
-        return (
-            "It’s still not going through. Please resend link and payment details again. If there’s an alternate UPI/bank account or helpline number, send that too.",
-            {"stage": state.stage},
-        )
+        # rotate prompts in VERIFY to avoid repetition
+        state.verifyRepeatCount += 1
+        if state.verifyRepeatCount % 3 == 1:
+            return prefix + "It’s still not going through. Please resend the link and payment details again. If there’s an alternate UPI/bank account + IFSC, send that too.", {"stage": state.stage}
+        if state.verifyRepeatCount % 3 == 2:
+            return prefix + "My app shows beneficiary mismatch. What exact beneficiary name should I see, and which branch/region is this?", {"stage": state.stage}
+        return prefix + "Which number should I call back? This message came from an unknown sender. Share the support number and reference ID.", {"stage": state.stage}
 
+    # fallback
+    if state.should_complete():
+        state.completed = True
     state.stage = "EXIT"
     return "Okay.", {"stage": state.stage}
