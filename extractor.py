@@ -20,9 +20,16 @@ BANK_RE = re.compile(r"\b\d{11,18}\b")
 # Lax bank: spaced/hyphenated digits => normalize and validate length
 BANK_LAX_RE = re.compile(r"\b(?:\d[\s-]?){11,22}\b")
 
-# Beneficiary patterns (covers: "Beneficiary: X", "Beneficiary name is X", "will show as X")
+# Beneficiary name patterns
+# 1) "Beneficiary name is Rahul Sharma", "name will show as 'SBI Support'"
 BENEF_RE = re.compile(
-    r"\bbeneficiary(?:\s+name)?\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z0-9 .&_-]{1,60})['\"]?",
+    r"\b(?:beneficiary(?:\s*name)?|name)\s*(?:is|:|will\s*show\s*as)\s*['\"]?([A-Za-z][A-Za-z .&]{1,60})['\"]?",
+    re.IGNORECASE,
+)
+
+# 2) "Beneficiary: Rahul Sharma"
+BENEF2_RE = re.compile(
+    r"\bbeneficiary\s*:\s*([A-Za-z][A-Za-z .&]{1,60})",
     re.IGNORECASE,
 )
 
@@ -50,24 +57,24 @@ def _digits_only(s: str) -> str:
 
 
 def _clean_url(u: str) -> str:
-    # remove trailing punctuation like . , ; ) ] >
+    # remove trailing punctuation like . , ; ) ]
     return (u or "").rstrip(").,;]>\"'")
 
 
-def _clean_beneficiary(name: str) -> str:
-    name = (name or "").strip()
-    # stop at common trailing tokens that appear in same sentence
-    name = re.split(r"\b(ifsc|upi|account|otp|link|phone|number)\b", name, flags=re.IGNORECASE)[0].strip()
-    # drop trailing punctuation
-    name = name.rstrip(".,;:- ")
-    return name
+def _clean_beneficiary_name(name: str) -> str:
+    n = (name or "").strip()
+    # Remove trailing tags like "IFSC ..." or "UPI ..." accidentally captured
+    n = re.sub(r"\s+(ifsc|upi|account|otp|link).*$", "", n, flags=re.IGNORECASE).strip()
+    # Remove extra double spaces
+    n = re.sub(r"\s{2,}", " ", n).strip()
+    return n
 
 
 def extract_all(text: str) -> Dict[str, List[str]]:
     t = (text or "").strip()
     lower = t.lower()
 
-    # URLs
+    # URLs (clean)
     phishing_links = _unique([_clean_url(u) for u in URL_RE.findall(t)])
 
     # Phones (10-digit core)
@@ -81,13 +88,20 @@ def extract_all(text: str) -> Dict[str, List[str]]:
 
     # Beneficiary names
     beneficiary = []
+
     for m in BENEF_RE.finditer(t):
-        name = _clean_beneficiary(m.group(1))
+        name = _clean_beneficiary_name(m.group(1))
         if len(name) >= 2:
             beneficiary.append(name)
+
+    for m in BENEF2_RE.finditer(t):
+        name = _clean_beneficiary_name(m.group(1))
+        if len(name) >= 2:
+            beneficiary.append(name)
+
     beneficiary = _unique(beneficiary)
 
-    # Bank accounts:
+    # Bank accounts
     banks = []
     banks += BANK_RE.findall(t)
 
@@ -98,9 +112,10 @@ def extract_all(text: str) -> Dict[str, List[str]]:
 
     banks = _unique(banks)
 
-    # Remove phone-like banks: 919876543210 -> +91 phone
-    phone_set = set(phones)
+    # Remove any that look like +91 phone in digits form (e.g., 919876543210)
+    # Rule: if len==12 and startswith 91 and last10 is a phone -> not a bank
     cleaned_banks = []
+    phone_set = set(phones)
     for b in banks:
         if len(b) == 12 and b.startswith("91") and b[-10:] in phone_set:
             continue
