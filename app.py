@@ -1,7 +1,7 @@
 # app.py
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 
 from config import API_KEY, CALLBACK_URL, ENV
@@ -18,14 +18,19 @@ app = FastAPI()
 # Helpers (GUVI-friendly responses)
 # -------------------------
 def ok_reply(text: str) -> Dict[str, str]:
+    # Required hackathon output format
     return {"status": "success", "reply": text}
 
 
-def invalid_request_body() -> JSONResponse:
-    # GUVI tester likes this style
+def soft_bad_body_reply() -> JSONResponse:
+    """
+    GUVI tester sometimes sends a weird/empty JSON.
+    We must NOT crash or return 422.
+    Also: don't send 'INVALID_REQUEST_BODY' (it pollutes the conversation).
+    """
     return JSONResponse(
         status_code=200,
-        content={"status": "success", "reply": "INVALID_REQUEST_BODY"},
+        content=ok_reply("Hi, I didn’t get the full message text. Please resend the exact SMS content."),
     )
 
 
@@ -60,14 +65,17 @@ async def honeypot(
     try:
         payload = await request.json()
     except Exception:
-        return invalid_request_body()
+        return soft_bad_body_reply()
 
     if not isinstance(payload, dict):
-        return invalid_request_body()
+        return soft_bad_body_reply()
 
     # 3) Read fields safely
     session_id = payload.get("sessionId")
     message = payload.get("message") or {}
+    if not isinstance(message, dict):
+        return soft_bad_body_reply()
+
     msg_text = (message.get("text") or "").strip()
 
     history = payload.get("conversationHistory") or []
@@ -75,13 +83,21 @@ async def honeypot(
 
     # If GUVI sends incomplete body, don't crash or 400
     if not session_id or not msg_text:
-        return ok_reply("Please resend the message text (content missing).")
+        return ok_reply("I didn’t receive the full message. Please resend the exact text you got.")
+
+    # Normalize history: must be list[dict]
+    if not isinstance(history, list):
+        history = []
+    history = [h for h in history if isinstance(h, dict)]
+
+    if not isinstance(metadata, dict):
+        metadata = {}
 
     # 4) Load session
     state = load_session(session_id)
 
     # If server restarted and GUVI sends conversationHistory, rebuild state
-    if is_fresh_state(state) and isinstance(history, list) and history:
+    if is_fresh_state(state) and history:
         rebuild_from_history(state, history, extract_all)
 
     # 5) Count turns (one per incoming request)
@@ -90,7 +106,8 @@ async def honeypot(
     # 6) Extract intelligence from incoming message
     extracted = extract_all(msg_text)
 
-    for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
+    # Merge extracted fields into state
+    for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers", "ifscCodes", "beneficiaryNames"]:
         vals = extracted.get(k, []) or []
         if not vals:
             continue
@@ -109,6 +126,7 @@ async def honeypot(
         det = detect_scam(msg_text, history, metadata)
         state.scamDetected = bool(det.get("scamDetected", False))
         state.scamType = det.get("scamType", "unknown")
+
         for kw in det.get("keywords", []) or []:
             if kw not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(kw)
@@ -157,6 +175,8 @@ if ENV != "prod":
                 "bankAccounts": state.bankAccounts,
                 "phishingLinks": state.phishingLinks,
                 "phoneNumbers": state.phoneNumbers,
+                "ifscCodes": getattr(state, "ifscCodes", []),
+                "beneficiaryNames": getattr(state, "beneficiaryNames", []),
                 "suspiciousKeywords": state.suspiciousKeywords,
             },
         }

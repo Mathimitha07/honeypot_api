@@ -15,7 +15,7 @@ class SessionState:
     completed: bool = False
     callbackFailures: int = 0
 
-    # extraction
+    # extracted intel
     upiIds: List[str] = field(default_factory=list)
     bankAccounts: List[str] = field(default_factory=list)
     phishingLinks: List[str] = field(default_factory=list)
@@ -24,18 +24,20 @@ class SessionState:
     beneficiaryNames: List[str] = field(default_factory=list)
     suspiciousKeywords: List[str] = field(default_factory=list)
 
-    # anti-loop + persona control
-    verifyRepeatCount: int = 0
-    frictionRepeatCount: int = 0
-    personaSeed: int = 0  # changes tone slightly per session
+    # anti-loop + realism controls
+    personaSeed: int = 0
+    lastIntent: str = ""  # e.g., "ASK_UPI", "ASK_BANK", "ASK_LINK", ...
+    repeatIntentCount: int = 0  # repeated same intent consecutively
+    usedExcuses: List[str] = field(default_factory=list)  # avoid repeating same excuse
 
     lastUpdated: float = field(default_factory=time.time)
 
     def should_complete(self) -> bool:
         """
-        Completion rule:
-        - don't end too early, but avoid "no callback" failures.
-        - prefer finishing once we have >=2 intel categories OR after enough turns.
+        Goal:
+        - Avoid ending too early (aim ~12–18 turns).
+        - Still guarantee callback eventually (hard stop).
+        - Finish earlier only if we already extracted rich intel (3+ categories).
         """
         categories = 0
         categories += 1 if self.upiIds else 0
@@ -44,16 +46,20 @@ class SessionState:
         categories += 1 if self.phoneNumbers else 0
         categories += 1 if self.ifscCodes else 0
 
-        # good intel captured and enough engagement
-        if categories >= 2 and self.turnCount >= 7:
+        # If we have rich intel, can finish earlier but still not too early
+        if categories >= 3 and self.turnCount >= 10:
             return True
 
-        # at least 1 intel but enough engagement
-        if categories >= 1 and self.turnCount >= 10:
+        # Normal finish window
+        if categories >= 2 and self.turnCount >= 12:
             return True
 
-        # hard stop
-        if self.turnCount >= 14:
+        # If only 1 category, keep engaging longer
+        if categories >= 1 and self.turnCount >= 16:
+            return True
+
+        # Hard stop to always trigger callback for scoring
+        if self.turnCount >= 18:
             return True
 
         return False
@@ -69,7 +75,7 @@ class SessionState:
                 "phishingLinks": self.phishingLinks,
                 "phoneNumbers": self.phoneNumbers,
                 "suspiciousKeywords": self.suspiciousKeywords,
-                # extra fields are safe (GUVI ignores unknown keys usually)
+                # extra fields (safe, GUVI usually ignores unknown keys)
                 "ifscCodes": self.ifscCodes,
                 "beneficiaryNames": self.beneficiaryNames,
             },
@@ -81,13 +87,15 @@ class SessionState:
         }
 
 
-# In-memory store
+# -------------------------
+# In-memory store (OK for hackathon; swap to Redis later)
+# -------------------------
 _STORE: Dict[str, SessionState] = {}
 
 
 def load_session(session_id: str) -> SessionState:
     if session_id not in _STORE:
-        # deterministic-ish seed to vary persona a bit
+        # deterministic-ish seed to vary persona per session
         seed = abs(hash(session_id)) % 3
         _STORE[session_id] = SessionState(sessionId=session_id, personaSeed=seed)
     return _STORE[session_id]
@@ -120,6 +128,7 @@ def rebuild_from_history(
     """
     Rebuild state if Render slept/restarted and memory got wiped.
     """
+    # +1 because current incoming message will also be counted in app.py
     state.turnCount = max(state.turnCount, len(history) + 1)
 
     for m in history:
@@ -129,10 +138,18 @@ def rebuild_from_history(
 
         extracted = extractor_fn(text)
 
-        for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers", "ifscCodes", "beneficiaryNames"]:
+        for k in [
+            "upiIds",
+            "bankAccounts",
+            "phishingLinks",
+            "phoneNumbers",
+            "ifscCodes",
+            "beneficiaryNames",
+        ]:
             vals = extracted.get(k, []) or []
             if not vals:
                 continue
+
             current = getattr(state, k, [])
             for v in vals:
                 if v not in current:
