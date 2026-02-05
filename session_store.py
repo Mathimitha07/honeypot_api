@@ -1,5 +1,6 @@
+# session_store.py
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Callable, Any
 import time
 
 
@@ -14,6 +15,10 @@ class SessionState:
     completed: bool = False
     callbackFailures: int = 0
 
+    # Anti-loop counters (prevents asking same thing repeatedly)
+    upiRepeatCount: int = 0
+    linkRepeatCount: int = 0
+
     upiIds: List[str] = field(default_factory=list)
     bankAccounts: List[str] = field(default_factory=list)
     phishingLinks: List[str] = field(default_factory=list)
@@ -23,19 +28,28 @@ class SessionState:
     lastUpdated: float = field(default_factory=time.time)
 
     def should_complete(self) -> bool:
+        """
+        Callback-safe completion rules.
+        Goal: avoid "no callback" scoring failures, but also avoid ending too early.
+        """
         categories = 0
         categories += 1 if self.upiIds else 0
         categories += 1 if self.bankAccounts else 0
         categories += 1 if self.phishingLinks else 0
         categories += 1 if self.phoneNumbers else 0
 
-        # safer to avoid "no callback"
+        # Strong signal: 2 categories + enough engagement
         if categories >= 2 and self.turnCount >= 8:
             return True
+
+        # Medium signal: 1 category + good engagement
         if categories >= 1 and self.turnCount >= 10:
             return True
+
+        # Hard stop: always finalize at some point
         if self.turnCount >= 14:
             return True
+
         return False
 
     def build_callback_payload(self) -> Dict[str, Any]:
@@ -58,6 +72,9 @@ class SessionState:
         }
 
 
+# -------------------------
+# In-memory session store (OK for hackathon). Replace with Redis later if needed.
+# -------------------------
 _STORE: Dict[str, SessionState] = {}
 
 
@@ -73,6 +90,7 @@ def save_session(state: SessionState) -> None:
 
 
 def is_fresh_state(state: SessionState) -> bool:
+    """True if this session was just created and has no meaningful state yet."""
     return (
         state.turnCount == 0
         and not state.upiIds
@@ -81,6 +99,7 @@ def is_fresh_state(state: SessionState) -> bool:
         and not state.phoneNumbers
         and not state.suspiciousKeywords
         and not state.scamDetected
+        and not state.completed
     )
 
 
@@ -89,8 +108,14 @@ def rebuild_from_history(
     history: List[Dict[str, Any]],
     extractor_fn: Callable[[str], Dict[str, List[str]]],
 ) -> None:
-    # do NOT overcount, just ensure it's at least the history length
-    state.turnCount = max(state.turnCount, len(history))
+    """
+    Rebuilds state from conversationHistory if server restarted and memory is lost.
+    extractor_fn should be extract_all(text) from extractor.py
+    """
+
+    # Estimate turns: all previous messages + current incoming message
+    # (current incoming message turn increment happens in app.py)
+    state.turnCount = max(state.turnCount, len(history) + 1)
 
     for m in history:
         text = (m.get("text") or "").strip()
@@ -99,15 +124,18 @@ def rebuild_from_history(
 
         extracted = extractor_fn(text)
 
+        # Merge unique extracted values
         for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
             vals = extracted.get(k, []) or []
-            if vals:
-                current = getattr(state, k, [])
-                for v in vals:
-                    if v not in current:
-                        current.append(v)
-                setattr(state, k, current)
+            if not vals:
+                continue
+            current = getattr(state, k, [])
+            for v in vals:
+                if v not in current:
+                    current.append(v)
+            setattr(state, k, current)
 
+        # Merge suspicious keywords
         for w in extracted.get("suspiciousKeywords", []) or []:
             if w not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(w)
