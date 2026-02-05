@@ -1,7 +1,6 @@
-# app.py
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, ConfigDict
@@ -15,9 +14,8 @@ from callback_reporter import try_send_final_callback
 
 app = FastAPI()
 
-# -------------------------
-# Models
-# -------------------------
+
+# ---------- Models ----------
 class Message(BaseModel):
     model_config = ConfigDict(extra="ignore")
     sender: Optional[str] = None
@@ -33,42 +31,31 @@ class HoneypotPayload(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-# -------------------------
-# Error handling (GUVI-style)
-# -------------------------
+# ---------- GUVI-style invalid body ----------
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # GUVI tester expects this exact style
+async def validation_exception_handler(request, exc):
     return JSONResponse(
         status_code=200,
-        content={"status": "error", "message": "INVALID_REQUEST_BODY", "errorCode": "E400"},
+        content={"status": "error", "message": "INVALID_REQUEST_BODY"},
     )
 
 
 def unauthorized():
     return JSONResponse(
         status_code=401,
-        content={"status": "error", "message": "UNAUTHORIZED", "errorCode": "E401"},
+        content={"status": "error", "message": "UNAUTHORIZED"},
     )
 
 
-# -------------------------
-# Health check
-# -------------------------
+# ---------- Health ----------
 @app.get("/")
 def root():
     return {"status": "ok"}
 
 
-# -------------------------
-# Main endpoint
-# -------------------------
+# ---------- Main ----------
 @app.post("/honeypot")
-def honeypot(
-    payload: HoneypotPayload,
-    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
-):
-    # Auth
+def honeypot(payload: HoneypotPayload, x_api_key: Optional[str] = Header(None, alias="x-api-key")):
     if not API_KEY or x_api_key != API_KEY:
         return unauthorized()
 
@@ -77,19 +64,16 @@ def honeypot(
     history = payload.conversationHistory or []
     metadata = payload.metadata or {}
 
-    # Load state
     state = load_session(session_id)
 
-    # Rebuild after Render sleep/restart
+    # rebuild if render slept and memory cleared
     if is_fresh_state(state) and history:
-        # Convert Message objects -> dicts
-        history_dicts = [m.model_dump() for m in history]
-        rebuild_from_history(state, history_dicts, extract_all)
+        rebuild_from_history(state, [m.model_dump() for m in history], extract_all)
 
-    # Count turns (one per incoming request)
+    # count turn per request
     state.turnCount = (state.turnCount or 0) + 1
 
-    # Extract intelligence from incoming message
+    # extract current message intel
     extracted = extract_all(msg_text)
 
     for k in ["upiIds", "bankAccounts", "phishingLinks", "phoneNumbers"]:
@@ -105,60 +89,24 @@ def honeypot(
         if w not in state.suspiciousKeywords:
             state.suspiciousKeywords.append(w)
 
-    # Detect scam intent once
+    # detect scam once
     if not state.scamDetected:
-        # Convert history to dicts for detector
-        history_dicts = [m.model_dump() for m in history]
-        det = detect_scam(msg_text, history_dicts, metadata)
+        det = detect_scam(msg_text, [m.model_dump() for m in history], metadata)
         state.scamDetected = det.get("scamDetected", False)
         state.scamType = det.get("scamType", "unknown")
         for kw in det.get("keywords", []) or []:
             if kw not in state.suspiciousKeywords:
                 state.suspiciousKeywords.append(kw)
 
-    # Generate reply
+    # reply
     if state.scamDetected:
-        # Convert history to dicts for agent
-        history_dicts = [m.model_dump() for m in history]
-        reply, updates = next_reply(state, msg_text, history_dicts, metadata)
+        reply, updates = next_reply(state, msg_text, [m.model_dump() for m in history], metadata)
         state.stage = updates.get("stage", state.stage)
     else:
         reply = "Okay. Can you share more details?"
 
-    # Mandatory callback
+    # callback when ready
     try_send_final_callback(state)
 
-    # Save state
     save_session(state)
-
     return {"status": "success", "reply": reply}
-
-
-# -------------------------
-# Debug routes only in dev
-# -------------------------
-if ENV != "prod":
-
-    @app.get("/debug/session/{session_id}")
-    def debug_session(session_id: str, x_api_key: Optional[str] = Header(None, alias="x-api-key")):
-        if not API_KEY or x_api_key != API_KEY:
-            return unauthorized()
-
-        state = load_session(session_id)
-        return {
-            "sessionId": state.sessionId,
-            "scamDetected": state.scamDetected,
-            "scamType": state.scamType,
-            "stage": state.stage,
-            "turnCount": state.turnCount,
-            "completed": state.completed,
-            "callbackFailures": state.callbackFailures,
-            "callbackUrlUsed": CALLBACK_URL,
-            "extractedIntelligence": {
-                "upiIds": state.upiIds,
-                "bankAccounts": state.bankAccounts,
-                "phishingLinks": state.phishingLinks,
-                "phoneNumbers": state.phoneNumbers,
-                "suspiciousKeywords": state.suspiciousKeywords,
-            },
-        }

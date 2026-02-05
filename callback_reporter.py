@@ -4,31 +4,15 @@ from session_store import SessionState
 
 
 def try_send_final_callback(state: SessionState) -> None:
-    """
-    Sends the mandatory GUVI final callback once engagement is complete.
-
-    CRITICAL RULE:
-    - Do NOT block callback just because stage is EXIT.
-    - Only set state.completed = True after callback success.
-    """
-    if state.completed:
+    if state.completed or state.callbackFailures >= 3:
         return
-
-    if state.callbackFailures >= 3:
+    if not state.scamDetected or not state.should_complete():
         return
-
-    if not state.scamDetected:
-        return
-
-    if not state.should_complete():
-        return
-
     if not CALLBACK_URL:
         state.callbackFailures += 1
         return
 
     payload = state.build_callback_payload()
-
     try:
         resp = requests.post(CALLBACK_URL, json=payload, timeout=8)
         if 200 <= resp.status_code < 300:
